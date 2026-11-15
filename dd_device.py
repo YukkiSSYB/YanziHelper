@@ -139,9 +139,12 @@ class WindowsDDDevice:
         command = [str(utility), action, instance]
         if force:
             command.append("/force")
-        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, timeout=20,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=20,
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+        except subprocess.TimeoutExpired as exc:
+            raise DeviceError(f"DD 设备设置超时（PnPUtil，{instance}），尚未确认设备状态。") from exc
         if result.returncode == 3010:
             raise RestartRequired("Windows 已保存 DD 设备设置，但要求重启才能完成；当前驱动未确认停止。")
         if result.returncode:

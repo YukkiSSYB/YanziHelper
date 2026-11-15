@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "description": "Source snapshot for the 2026-11-15 update, covering the same nine runtime modules as SOURCE_PROVENANCE.json. Hashes use the LF file content stored in Git. See NOTICE.md and docs/PROVENANCE.md.",
+  "markers": ["Yukki", "ssyb"],
+  "generated_at_utc": "2026-11-15T15:43:52+00:00",
+  "files": [
+    {
+      "path": "YanziHelper.py",
+      "sha256": "a7d8c83075492ff2084d94bc7a62c0c08220c080237f944c049bd6e77c169878"
+    },
+    {
+      "path": "app_config.py",
+      "sha256": "c53a2a8d078be8792380a62e28d8bf6bcbb1ad71e509bea8e31873932773da35"
+    },
+    {
+      "path": "app_selftest.py",
+      "sha256": "aa3a9a783162b6b43ef028030221c9ff7a2f4c8656df774f7405e5a289ab5520"
+    },
+    {
+      "path": "dd_device.py",
+      "sha256": "bb51d0c4d7a1d249b34ea6c2a831c1e178399b9ec3d5db7913cc631657069721"
+    },
+    {
+      "path": "dd_lifecycle.py",
+      "sha256": "95588290eb147198c893ed61a7c5bd22276a90b7232b3acca4469f7bae7ced95"
+    },
+    {
+      "path": "foreground_guard.py",
+      "sha256": "5b13cf82d59e8708f8378cfd3a9e3a617c195e4bd4d5590c3900652f6d66a2ed"
+    },
+    {
+      "path": "keyboard_hook.py",
+      "sha256": "5efabf84ab55c6834feee4f53548c4da4353f22301fbc077b8631ac8b53c86c5"
+    },
+    {
+      "path": "macro_engine.py",
+      "sha256": "c47a38305aeeae02f06d3d678de26563f81a7ee7dbdebf843f2c767e64a63fd3"
+    },
+    {
+      "path": "pydd.py",
+      "sha256": "84f198a7f15025460ea7bc82a3c4d50ba99284220fcd1ab9b93abe577978b39b"
+    }
+  ]
+}

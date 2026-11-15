@@ -18,8 +18,10 @@ WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
 WM_QUIT = 0x0012
+LLKHF_EXTENDED = 0x01
 LLKHF_INJECTED = 0x10
 LLKHF_LOWER_IL_INJECTED = 0x02
+MAPVK_VK_TO_VSC_EX = 4
 ERROR_INVALID_HOOK_HANDLE = 1404
 
 VK_CODES = {chr(c).lower(): c for c in range(ord("A"), ord("Z") + 1)}
@@ -28,6 +30,12 @@ VK_CODES.update({f"f{i}": 0x70 + i - 1 for i in range(1, 13)})
 VK_CODES.update({f"num{i}": 0x60 + i for i in range(10)})
 VK_CODES.update({"tab": 0x09, "space": 0x20})
 VK_TO_KEY = {vk: key for key, vk in VK_CODES.items()}
+# NumLock/Shift can make a held numpad key appear under a navigation VK.
+NUMPAD_NAVIGATION_ALIASES = {
+    "num0": 0x2D, "num1": 0x23, "num2": 0x28, "num3": 0x22,
+    "num4": 0x25, "num5": 0x0C, "num6": 0x27, "num7": 0x24,
+    "num8": 0x26, "num9": 0x21,
+}
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -46,6 +54,7 @@ def _normalize(key: str) -> str:
 
 @dataclass(frozen=True)
 class _HeldKey:
+    key: str
     suppressed: bool
     watched: bool
 
@@ -63,7 +72,7 @@ class HookState:
         self.suppressed: frozenset[str] = frozenset()
         self.watched: frozenset[str] = frozenset()
         self.enabled = False
-        self.held: dict[str, _HeldKey] = {}
+        self.held: dict[str | tuple[int, bool], _HeldKey] = {}
 
     def configure(
         self, toggle: str, suppressed: set[str], watched: set[str], enabled: bool
@@ -73,27 +82,37 @@ class HookState:
         self.watched = frozenset(_normalize(key) for key in watched if _normalize(key))
         self.enabled = bool(enabled)
 
+    def seed_held(self, key: str, physical_key: tuple[int, bool] | None = None) -> None:
+        """Pass through a hold that began before the hook was installed."""
+        key = _normalize(key)
+        self.held.setdefault(physical_key if physical_key is not None else key,
+                             _HeldKey(key, False, False))
+
     def transition(
-        self, key: str, down: bool, injected: bool = False
+        self, key: str, down: bool, injected: bool = False,
+        *, physical_key: tuple[int, bool] | None = None,
     ) -> tuple[bool, tuple[tuple[str, str], ...]]:
         # Yukki / ssyb [KEY-02]: a physical hold keeps its first-down decision.
         key = _normalize(key)
-        if injected or not key:
+        if injected or (not key and physical_key is None):
             return False, ()
+        identity = physical_key if physical_key is not None else key
         if down:
-            held = self.held.get(key)
+            held = self.held.get(identity)
             if held is not None:
                 return held.suppressed, ()
             toggle = bool(self.toggle) and key == self.toggle
             suppressed = toggle or (self.enabled and key in self.suppressed)
             watched = toggle or (self.enabled and (key in self.suppressed or key in self.watched))
-            self.held[key] = _HeldKey(suppressed, watched)
+            # VK can change mid-hold (e.g. Num8 becomes Up after pressing Shift).
+            # Retain even unsupported keys so a repeat cannot become a new press.
+            self.held[identity] = _HeldKey(key, suppressed, watched)
             return suppressed, (("press", key),) if watched else ()
-        held = self.held.pop(key, None)
+        held = self.held.pop(identity, None)
         if held is None:
             # The hook may have started while this key was already held.
             return False, ()
-        return held.suppressed, (("release", key),) if held.watched else ()
+        return held.suppressed, (("release", held.key),) if held.watched else ()
 
 
 class _Win32Backend:
@@ -136,6 +155,8 @@ class _Win32Backend:
         self.user32.PostThreadMessageW.restype = wintypes.BOOL
         self.user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
         self.user32.GetAsyncKeyState.restype = wintypes.SHORT
+        self.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        self.user32.MapVirtualKeyW.restype = wintypes.UINT
         self.kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
         self.kernel32.GetModuleHandleW.restype = wintypes.HMODULE
         self.kernel32.GetCurrentThreadId.argtypes = []
@@ -274,12 +295,15 @@ class KeyboardHook:
                 WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP
             ):
                 event = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                key = VK_TO_KEY.get(int(event.vkCode))
+                key = VK_TO_KEY.get(int(event.vkCode), "")
                 injected = bool(event.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED))
-                if key and not injected:
+                scan = int(event.scanCode)
+                physical_key = (scan, bool(event.flags & LLKHF_EXTENDED)) if scan else None
+                if not injected and (key or physical_key is not None):
                     with self._state_lock:
                         suppress, events = self._state.transition(
-                            key, w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                            key, w_param in (WM_KEYDOWN, WM_SYSKEYDOWN),
+                            physical_key=physical_key,
                         )
                         for queued in events:
                             self._emit(queued)
@@ -309,7 +333,19 @@ class KeyboardHook:
                     if backend.user32.GetAsyncKeyState(vk) & 0x8000:
                         # Preserve an existing game's key-down/up pair and do
                         # not mistake its next autorepeat for a new trigger.
-                        self._state.held.setdefault(key, _HeldKey(False, False))
+                        scan = backend.user32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC_EX)
+                        physical_key = (scan & 0xFF, bool(scan & 0xFF00)) if scan else None
+                        self._state.seed_held(key, physical_key)
+                for key, alias_vk in NUMPAD_NAVIGATION_ALIASES.items():
+                    if backend.user32.GetAsyncKeyState(alias_vk) & 0x8000:
+                        # Async VK state cannot distinguish the separate arrow
+                        # from the numpad. Prefer no accidental macro: pass the
+                        # matching numpad hold through until its first key-up.
+                        # If only the separate arrow was held, the first numpad
+                        # press also passes through; following presses work.
+                        scan = backend.user32.MapVirtualKeyW(VK_CODES[key], MAPVK_VK_TO_VSC_EX)
+                        physical_key = (scan & 0xFF, False) if scan else None
+                        self._state.seed_held(key, physical_key)
             self._ready.set()
             while not self._stop.is_set():
                 result = backend.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)

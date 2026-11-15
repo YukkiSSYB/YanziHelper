@@ -21,6 +21,10 @@ from dd_device import DDDeviceController, DeviceError, RestartRequired, _signatu
 MUTEX = r"Global\YanziHelper.DDHID63340.Lifecycle.v1"
 
 
+class StopRequestError(DeviceError):
+    """The parent could not notify its guardian; device shutdown is unverified."""
+
+
 def write_state(path, **state):
     data = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), **state}
     temporary = path.with_suffix(".tmp")
@@ -30,9 +34,14 @@ def write_state(path, **state):
 
 def read_state(path):
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DeviceError(f"读取 DD 监护状态失败，当前无法确认驱动状态：{path}（{exc}）") from exc
+    if not isinstance(state, dict):
+        raise DeviceError(f"DD 监护状态格式无效，当前无法确认驱动状态：{path}（应为 JSON 对象）")
+    return state
 
 
 class ProcessHandles:
@@ -92,26 +101,47 @@ def run_guardian(parent_pid, parent_birth, folder, report_path):
     owns_device = False
 
     def report(phase, **details):
-        write_state(state_path, phase=phase, guardian_pid=os.getpid(), **details)
         # A refused second instance must not overwrite the active one's report.
-        if mutex:
-            write_state(report_path, phase=phase, guardian_pid=os.getpid(), **details)
+        paths = (report_path, state_path) if mutex else (state_path,)
+        report_errors = {}
+        state_written = False
+        for path in paths:
+            try:
+                write_state(path, phase=phase, guardian_pid=os.getpid(),
+                            **details, **({"report_errors": report_errors} if report_errors else {}))
+            except OSError as exc:
+                # Neither a missing IPC directory nor a failed diagnostic write
+                # may prevent the guardian from disabling an owned device.
+                report_errors[str(path)] = str(exc)
+            else:
+                if path == state_path:
+                    state_written = True
+        return state_written
 
-    def stop():
+    def stop(startup_error=""):
+        context = {"startup_error": startup_error} if startup_error else {}
         error = ""
         for attempt in range(3):
             try:
                 snapshot = controller.stop()
-                report("stopped", snapshot=snapshot)
+                if startup_error:
+                    report("failed", error=startup_error, cleanup_ok=True, snapshot=snapshot)
+                else:
+                    report("stopped", snapshot=snapshot)
                 return True
             except RestartRequired as exc:
-                report("restart_required", error=str(exc), snapshot=controller.backend.snapshot())
+                details = {"error": str(exc), "cleanup_ok": False, **context}
+                try:
+                    details["snapshot"] = controller.backend.snapshot()
+                except Exception as snapshot_exc:
+                    details["snapshot_error"] = str(snapshot_exc)
+                report("restart_required", **details)
                 return False
             except Exception as exc:
                 error = str(exc)
-                report("stopping", error=error)
+                report("stopping", error=error, **context)
                 time.sleep(.5 * (attempt + 1))
-        report("failed", error="DD 驱动停用未完成：" + error)
+        report("failed", error="DD 驱动停用未完成：" + error, cleanup_ok=False, **context)
         return False
 
     try:
@@ -124,14 +154,19 @@ def run_guardian(parent_pid, parent_birth, folder, report_path):
         if (folder / "stop").exists() or not handles.alive(parent):
             return 0 if stop() else 1
         snapshot = controller.start()
-        report("ready", snapshot=snapshot)
+        if not report("ready", snapshot=snapshot):
+            raise DeviceError("无法向助手报告 DD 启动状态，监护进程将停用设备。")
         while handles.alive(parent) and not (folder / "stop").exists():
             time.sleep(.1)
         return 0 if stop() else 1
     except Exception as exc:
         error = str(exc)
-        cleanup_ok = not owns_device or stop()
-        report("failed", error=error, cleanup_ok=cleanup_ok)
+        if owns_device:
+            # Keep the terminal cleanup result (especially restart_required)
+            # instead of replacing it with the original startup failure.
+            stop(startup_error=error)
+        else:
+            report("failed", error=error, cleanup_ok=True)
         return 1
     finally:
         if mutex:
@@ -203,7 +238,7 @@ class DDDriverSession:
         while True:
             state = read_state(self.folder / "state.json")
             if self.process.poll() is not None:
-                self.error = state.get("error", "DD 监护进程未能启动。")
+                self.error = state.get("error") or "DD 监护进程未能启动。"
                 cleanup_session(self.folder)
                 raise DeviceError(self.error)
             if state.get("phase") == "ready":
@@ -216,7 +251,13 @@ class DDDriverSession:
 
     def request_stop(self):
         if self.process is not None and not self.stop_requested and self.process.poll() is None:
-            (self.folder / "stop").touch()
+            try:
+                (self.folder / "stop").touch()
+            except OSError as exc:
+                raise StopRequestError(
+                    f"无法发送 DD 停用请求，当前尚未确认驱动停止：{exc}。"
+                    "助手进程退出后，独立监护将继续尝试清理。"
+                ) from exc
             self.stop_requested = True
 
     def close(self):
@@ -234,7 +275,7 @@ class DDDriverSession:
         state = read_state(self.folder / "state.json")
         self.finished = True
         if self.process.returncode != 0 or state.get("phase") != "stopped":
-            self.error = state.get("error", "未能确认 DD 驱动已经停止，请查看 dd-driver-status.json。")
+            self.error = state.get("error") or "未能确认 DD 驱动已经停止，请查看 dd-driver-status.json。"
             self.error_type = RestartRequired if state.get("phase") == "restart_required" else DeviceError
         cleanup_session(self.folder)
         if self.error:
@@ -244,7 +285,7 @@ class DDDriverSession:
     def check_alive(self):
         if self.process is not None and self.process.poll() is not None:
             state = read_state(self.folder / "state.json")
-            raise DeviceError(state.get("error", "DD 监护进程意外退出，请退出助手后重新打开。"))
+            raise DeviceError(state.get("error") or "DD 监护进程意外退出，请退出助手后重新打开。")
 
 
 def ensure_administrator():

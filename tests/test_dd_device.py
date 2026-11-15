@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -64,6 +65,20 @@ class DeviceControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(DeviceError, "vetoed"):
             self.controller.stop()
         self.assertEqual(self.backend.disable.call_count, 2)
+
+    def test_pnp_timeout_still_attempts_remaining_devices(self):
+        native = WindowsDDDevice.__new__(WindowsDDDevice)
+        native.cm = MagicMock()
+        native.cm.CM_Disable_DevNode.return_value = 0x28
+        controller = DDDeviceController(native, timeout=0)
+        with patch.object(native, "devices", return_value=["DD-1", "DD-2"]), \
+                patch.object(native, "_node", return_value=123), \
+                patch.object(native, "validate"), \
+                patch("dd_device.subprocess.run", side_effect=[
+                    subprocess.TimeoutExpired("pnputil", 20), MagicMock(returncode=0)]) as run:
+            with self.assertRaisesRegex(DeviceError, "超时.*DD-1"):
+                controller.stop()
+        self.assertEqual([call.args[0][2] for call in run.call_args_list], ["DD-1", "DD-2"])
 
     def test_disable_uses_persistent_flag_and_validates_before_mutation(self):
         native = WindowsDDDevice.__new__(WindowsDDDevice)

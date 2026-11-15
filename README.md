@@ -57,7 +57,22 @@ DD 63340 可能只保存禁用设置，并要求重启后才停止内核驱动�
 
 构建前需自行提供 `ddhid.63340.dll`、`start.wav`、`stop.wav`；音效必须为非空 PCM WAV。图标可选。这些文件因许可或来源未确认而不随仓库分发。请只打包有权再分发的资源。
 
-构建脚本依次执行回归测试、PyInstaller 单文件打包和隐藏自检；自检通过后更新 `release/` 并生成 ZIP。自检只用内存模拟驱动，验证 DLL 文件存在，不加载它。公开源码中的 `config.example.ini` 会作为无个人配置时的构建默认配置。已有发行配置会保留，已有 EXE/ZIP 会备份。
+构建脚本先校验实际配置，再执行回归测试、PyInstaller 单文件打包和隐藏自检。自检会读取并验证内嵌默认配置，使用内存模拟驱动，检查 DLL 文件存在但不加载它，也不修改个人配置。自检报告记录 EXE 的 SHA-256，包装时核对，防止误用旧报告。
+
+完整候选发行目录和 ZIP 验证通过后才更新正式产物；提交失败会尝试恢复旧版本。公开源码中的 `config.example.ini` 会作为无个人配置时的构建默认配置。已有发行配置会保留并校验，旧发行文件和 ZIP 会备份。
+
+## 可选：构建含驱动版的一键启动器
+
+[启动器源码](tools/driver_kit/Launcher.cs)适用于 Windows x64。用户解压后双击 `启动助手.exe` 并允许管理员授权。已有匹配的 DD HID 63340 设备时，启动器直接打开助手；缺失时先运行原厂安装器，重新检测到匹配设备后才打开助手。Windows 若提示重启，请手动重启后再试。
+
+先按上节构建正式版，再准备一个只含同版原厂 `ddc.exe`、`ddhid63340.inf`、`ddhid63340.sys`、`ddhid63340.cat` 的目录。下面的第一条命令可独立运行，不需要驱动或发行文件；第二条命令用本机的 .NET Framework 编译器生成与该正式版 EXE 匹配的启动器。
+
+```powershell
+.\tools\driver_kit\build_launcher.ps1 -TestOnly
+.\tools\driver_kit\build_launcher.ps1 -DriverDirectory .\vendor\ddhid63340 -ReleaseDirectory .\release
+```
+
+制作本地使用包时，在新目录解压标准 ZIP，将生成的 `启动助手.exe` 放在 `YanziHelper.exe` 旁，把上述四个原厂文件放入同级的 `driver\` 子目录，再压缩整个目录。更换助手 EXE 后须重新构建启动器。仓库不提供第三方驱动二进制，来源及许可核查见[相关说明](docs/DD-LICENSE.md)。
 
 ## 代码结构
 
@@ -74,7 +89,7 @@ DD 63340 可能只保存禁用设置，并要求重启后才停止内核驱动�
 
 ## 署名与来源核对
 
-8 个关键模块包含 16 处带编号的 Yukki / ssyb 注释标记，不改变程序运行。初次整理的核心源码 SHA-256 记录在 [SOURCE_PROVENANCE.json](SOURCE_PROVENANCE.json)，核验方法见 [docs/PROVENANCE.md](docs/PROVENANCE.md)。
+8 个关键模块包含 16 处带编号的 Yukki / ssyb 注释标记，不改变程序运行。首次及本次核心源码的 SHA-256 快照与核验方法见[来源标记与版本指纹](docs/PROVENANCE.md)。
 
 复制或分发时请保留适用的版权与许可声明。来源标记用于辅助追溯；本项目没有增加隐蔽运行逻辑或联网追踪。
 

@@ -1,7 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+import sys
 
 project_dir = Path(SPECPATH)
+sys.path.insert(0, str(project_dir))
+from tools.package_release import validate_profile
 resources = ("ddhid.63340.dll", "start.wav", "stop.wav")
 missing = [filename for filename in resources if not (project_dir / filename).is_file()]
 if missing:
@@ -12,6 +15,7 @@ if not config_source.is_file():
     config_source = project_dir / "config.example.ini"
 if not config_source.is_file():
     raise SystemExit("Release configuration is missing: provide config.ini or config.example.ini.")
+validate_profile(config_source)
 resource_data = [(str(project_dir / filename), ".") for filename in resources]
 if (project_dir / "24983.png").is_file():
     resource_data.append((str(project_dir / "24983.png"), "."))

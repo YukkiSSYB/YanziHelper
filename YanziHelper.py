@@ -16,7 +16,7 @@ from keyboard_hook import KeyboardHook
 from macro_engine import MacroEngine
 from pydd import DDError, PyDD
 from foreground_guard import ForegroundGuard
-from dd_lifecycle import DDDriverSession, ensure_administrator, run_guardian
+from dd_lifecycle import DDDriverSession, StopRequestError, ensure_administrator, run_guardian
 from dd_device import RestartRequired
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -31,7 +31,18 @@ COLOR_STOP, COLOR_RUN = "#ff7777", "#8fff8f"
 
 
 def load_config():
-    return {**DEFAULTS, **read_config_file(BUNDLED_CONFIG_FILE), **read_config_file(CONFIG_FILE)}
+    # A valid user profile must remain usable even if an older executable
+    # contains a malformed bundled default. Never hide errors in that profile.
+    external = read_config_file(CONFIG_FILE)
+    if BUNDLED_CONFIG_FILE == CONFIG_FILE:
+        return {**DEFAULTS, **external}
+    try:
+        bundled = read_config_file(BUNDLED_CONFIG_FILE)
+    except (OSError, configparser.Error, UnicodeError):
+        if not external:
+            raise
+        return validate_config(external)
+    return {**DEFAULTS, **bundled, **external}
 
 
 def save_config(data):
@@ -71,7 +82,7 @@ class YanziHelper:
         config_error = ""
         try:
             self.cfg = load_config()
-        except (OSError, configparser.Error, UnicodeError) as exc:
+        except (OSError, configparser.Error, UnicodeError, ValueError) as exc:
             self.config_load_failed = True
             config_error = f"读取配置失败：{exc}"
         root.title("YanziHelper")
@@ -304,8 +315,9 @@ class YanziHelper:
     def refresh_hotkey_cache(self):
         cfg = self.active_config if self.macro_enabled else self.collect_config()
         suppressed, watched = hotkey_sets(cfg)
-        self.hook.configure("" if self.profile_dialog_active else cfg["toggle"], suppressed, watched,
-                            self.macro_enabled and not self.profile_dialog_active)
+        suspended = self.profile_dialog_active or self.closing
+        self.hook.configure("" if suspended else cfg["toggle"], suppressed, watched,
+                            self.macro_enabled and not suspended)
 
     def stop_macro(self, error=""):
         self.macro_enabled = False
@@ -354,7 +366,8 @@ class YanziHelper:
                 self.enable_config(cfg)
         except (ValueError, DDError, OSError) as exc:
             self.stop_macro(str(exc))
-            messagebox.showerror("无法启动", str(exc), parent=self.root)
+            with self.profile_dialog():
+                messagebox.showerror("无法启动", str(exc), parent=self.root)
 
     def enable_config(self, cfg):
         if not self.foreground_guard.allows_output():
@@ -376,7 +389,8 @@ class YanziHelper:
                 self.device_session.check_alive()
             except DDError as exc:
                 self.stop_macro(str(exc))
-                messagebox.showerror("DD 设备监护中断", str(exc), parent=self.root)
+                with self.profile_dialog():
+                    messagebox.showerror("DD 设备监护中断", str(exc), parent=self.root)
                 self.on_close()
                 return
         if ((self.macro_enabled or self.pending_enable_config is not None)
@@ -446,6 +460,13 @@ class YanziHelper:
                     self.status_label.config(text="● 正在退出，停用 DD 设备并确认驱动停止…", fg=COLOR_TITLE)
                     self.root.after(100, self.finish_close)
                     return
+            except StopRequestError as exc:
+                # Hook, worker and DLL are already closed. Exiting the parent
+                # lets the independent guardian use its process-death fallback.
+                messagebox.showerror("DD 停用请求未送达",
+                                     f"{exc}\n程序将退出，由独立监护进程继续尝试停用。"
+                                     "当前尚未确认驱动停止；请检查 dd-driver-status.json，必要时重启系统。",
+                                     parent=self.root)
             except DDError as exc:
                 messagebox.showerror("DD 停用需要重启" if isinstance(exc, RestartRequired) else "DD 驱动尚未确认停止",
                                      f"{exc}\n请查看程序目录的 dd-driver-status.json；必要时重启系统。",
@@ -498,10 +519,16 @@ def main():
                     # Normal window closing retries visibly in finish_close().
                     # Do not replace an unrelated mainloop exception here.
                     pass
-            if stopped:
-                device_session.request_stop()
+            request_stop = stopped
         else:
-            device_session.request_stop()
+            request_stop = True
+        if request_stop:
+            try:
+                device_session.request_stop()
+            except DDError:
+                # A failed IPC write must not prevent the parent from exiting:
+                # the guardian also watches this process handle independently.
+                pass
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import threading
@@ -42,7 +43,8 @@ def run(report_path: Path) -> int:
     The executable's entry module is preferred so these checks exercise its
     actual class and resources. The static fallback also supports importing
     this function from source and lets the packager discover dependencies.
-    No user profile is read or written, no global hook is installed, and all
+    Only the bundled/default configuration is read; user profiles are untouched.
+    No global hook is installed, and all
     requested keys are delivered solely to the in-memory fake driver.
     """
     started = time.monotonic()
@@ -101,6 +103,19 @@ def run(report_path: Path) -> int:
         if module is None or not hasattr(module, "YanziHelper"):
             import YanziHelper as module
         import tkinter as tk
+
+        config_path = (module.BUNDLED_CONFIG_FILE if report["frozen"]
+                       else module.BASE_DIR / "config.example.ini")
+        require(config_path.is_file(), "bundled/default configuration missing")
+        bundled_config = module.read_config_file(config_path)
+        require(bool(bundled_config), "bundled/default configuration has no usable [SETTINGS]")
+        module.validate_config(bundled_config)
+        with config_path.open("rb") as stream:
+            report["bundled_config_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        if report["frozen"]:
+            with Path(sys.executable).open("rb") as stream:
+                report["executable_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
+        check("bundled_configuration_valid")
 
         patch(module, "load_config", lambda: dict(module.DEFAULTS))
         patch(module, "save_config", lambda data: saved_configs.append(dict(data)))

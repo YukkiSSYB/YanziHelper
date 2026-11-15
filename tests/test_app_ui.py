@@ -1,3 +1,4 @@
+import configparser
 import queue
 import tkinter as tk
 import unittest
@@ -78,6 +79,32 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertFalse(self.ui.macro_enabled)
         self.error.assert_called_once()
 
+    def test_start_failure_dialog_discards_hotkeys_before_manual_retry(self):
+        self.ui.dd = None
+
+        def show_error(*args, **kwargs):
+            self.assertTrue(self.ui.profile_dialog_active)
+            self.assertEqual(self.ui.hook._state.toggle, "")
+            for down in (True, False):
+                _, events = self.ui.hook._state.transition(DEFAULTS["toggle"], down)
+                self.assertEqual(events, ())
+            self.ui.toggle_macro()
+            # Also discard a press already in flight when the dialog opened.
+            self.ui.events.put(("press", DEFAULTS["toggle"]))
+
+        self.error.side_effect = show_error
+        with patch.object(app, "PyDD", side_effect=[app.DDError("temporary failure"), self.driver]) as factory:
+            self.ui.events.put(("press", DEFAULTS["toggle"]))
+            self.drain()
+            self.assertFalse(self.ui.macro_enabled)
+            self.assertIsNone(self.ui.engine)
+            self.assertTrue(self.ui.events.empty())
+            self.assertEqual(factory.call_count, 1)
+            self.assertEqual(self.ui.hook._state.toggle, DEFAULTS["toggle"])
+            self.ui.toggle_macro()
+            self.assertTrue(self.ui.macro_enabled)
+            self.assertEqual(factory.call_count, 2)
+
     def test_queued_presses_use_snapshot_and_correct_plan(self):
         self.ui.apply_config({**DEFAULTS, "sy_low": "z", "target_low_key": "f5"})
         fake_engine = MagicMock()
@@ -146,6 +173,30 @@ class AppIntegrationTests(unittest.TestCase):
         self.assertTrue(self.ui.closed)
         self.error.assert_called_once()
         self.assertIn("needs reboot", self.error.call_args.args[1])
+
+    def test_missing_stop_directory_exits_after_dll_release_for_guardian_fallback(self):
+        with TemporaryDirectory(prefix="yanzi-stop-test-") as folder:
+            session = app.DDDriverSession(Path(folder) / "entry.py", Path(folder) / "report.json")
+            session.folder = Path(folder) / "missing-session"
+            session.process = MagicMock()
+            session.process.poll.return_value = None
+            self.ui.device_session = session
+
+            def show_error(*args, **kwargs):
+                self.driver.close.assert_called_once()
+                self.assertEqual(self.ui.hook._state.toggle, "")
+
+            self.error.side_effect = show_error
+            self.ui.on_close()
+            self.assertTrue(self.ui.closed)
+            self.assertIsNone(self.ui.poll_id)
+            self.assertFalse(session.stop_requested)
+            self.assertFalse(session.finished)
+            self.error.assert_called_once()
+            self.assertIn("独立监护", self.error.call_args.args[1])
+            self.assertIn("尚未确认", self.error.call_args.args[1])
+            session.process.terminate.assert_not_called()
+            session.process.kill.assert_not_called()
 
     def test_save_failure_does_not_skip_cleanup(self):
         self.save.side_effect = OSError("disk full")
@@ -354,6 +405,26 @@ class AppIntegrationTests(unittest.TestCase):
 
 
 class ConfigurationLoadFailureTests(unittest.TestCase):
+    def test_valid_external_profile_survives_malformed_bundled_defaults(self):
+        with TemporaryDirectory(prefix="yanzi-config-test-") as folder:
+            bundle, profile = Path(folder) / "bundle.ini", Path(folder) / "config.ini"
+            bundle.write_text("[SETTINGS]\ninvalid line\n", encoding="utf-8")
+            expected = {**DEFAULTS, "sy1": "z", "delay_ms": "350"}
+            app.write_config_file(profile, expected)
+            with patch.object(app, "BUNDLED_CONFIG_FILE", bundle), patch.object(app, "CONFIG_FILE", profile):
+                self.assertEqual(app.load_config(), expected)
+
+    def test_malformed_bundle_without_valid_profile_is_not_silently_ignored(self):
+        with TemporaryDirectory(prefix="yanzi-config-test-") as folder:
+            bundle, profile = Path(folder) / "bundle.ini", Path(folder) / "config.ini"
+            bundle.write_text("[SETTINGS]\ninvalid line\n", encoding="utf-8")
+            with patch.object(app, "BUNDLED_CONFIG_FILE", bundle), patch.object(app, "CONFIG_FILE", profile):
+                with self.assertRaises(configparser.Error):
+                    app.load_config()
+                profile.write_text("[SETTINGS]\nsy1 = f3\n", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    app.load_config()
+
     def test_opening_and_closing_malformed_profile_preserves_original_bytes(self):
         with TemporaryDirectory(prefix="yanzi-config-test-") as folder:
             profile = Path(folder) / "config.ini"
@@ -377,6 +448,28 @@ class ConfigurationLoadFailureTests(unittest.TestCase):
                     ui.hook.close()
                 if ui is None or not ui.closed:
                     root.destroy()
+
+
+class MainShutdownTests(unittest.TestCase):
+    def test_stop_request_failure_does_not_prevent_exit_or_mask_mainloop_error(self):
+        for mainloop_error in (None, RuntimeError("original mainloop failure")):
+            with self.subTest(mainloop_error=mainloop_error):
+                root, session, ui = MagicMock(), MagicMock(), MagicMock()
+                root.mainloop.side_effect = mainloop_error
+                session.request_stop.side_effect = app.StopRequestError("IPC unavailable")
+                ui.engine = ui.dd = None
+                with patch.object(app.sys, "argv", ["YanziHelper.py"]), \
+                        patch.object(app, "ensure_administrator", return_value=True), \
+                        patch.object(app.tk, "Tk", return_value=root), \
+                        patch.object(app, "DDDriverSession", return_value=session), \
+                        patch.object(app, "YanziHelper", return_value=ui):
+                    if mainloop_error is None:
+                        app.main()
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "original mainloop failure"):
+                            app.main()
+                session.request_stop.assert_called_once()
+                ui.hook.close.assert_called_once()
 
 
 if __name__ == "__main__":
