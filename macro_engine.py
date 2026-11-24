@@ -10,12 +10,20 @@ from dataclasses import dataclass
 
 
 @dataclass
+class PeriodicKey:
+    key: str
+    interval: float
+    due_at: float
+
+
+@dataclass
 class _Sequence:
     token: int
     trigger: str
     steps: tuple[tuple[str, float], ...]
     repeat: bool
     interval: float
+    periodic: PeriodicKey | None = None
     released: bool = False
 
 
@@ -87,8 +95,9 @@ class MacroEngine:
         steps: tuple[tuple[str, float], ...],
         repeat: bool = False,
         interval: float = 1.2,
-    ) -> None:
-        """Replace the current sequence; ignore repeated keydowns while held."""
+        *, periodic: PeriodicKey | None = None,
+    ) -> bool:
+        """Queue the new sequence and return whether it was accepted."""
         trigger = trigger.strip().lower()
         if not trigger:
             raise ValueError("触发按键不能为空")
@@ -105,13 +114,14 @@ class MacroEngine:
             if self._closed:
                 raise RuntimeError("按键执行器已关闭")
             if self._faulted or self._recovering or self._stopping or trigger in self._held:
-                return
+                return False
             self._held.add(trigger)
             self._token += 1
             self._pending = _Sequence(
-                self._token, trigger, normalized, bool(repeat), interval
+                self._token, trigger, normalized, bool(repeat), interval, periodic
             )
             self._condition.notify_all()
+            return True
 
     def release(self, trigger: str) -> None:
         """Finish the first sequence, but cancel subsequent repeats."""
@@ -255,6 +265,13 @@ class MacroEngine:
     def _execute(self, sequence: _Sequence) -> None:
         first = True
         while True:
+            periodic = sequence.periodic
+            if periodic is not None and time.monotonic() >= periodic.due_at:
+                if not self._send_step(sequence, periodic.key, first):
+                    return
+                periodic.due_at = time.monotonic() + periodic.interval
+                if not self._wait(sequence, sequence.interval, first):
+                    return
             for key, delay in sequence.steps:
                 if not self._wait(sequence, delay, first):
                     return

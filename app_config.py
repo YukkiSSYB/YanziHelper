@@ -26,6 +26,36 @@ TRIGGER_LABELS = {"toggle": "总开关", "sy1": "上元普通键", "xl1": "翔�
                   "sy_low": "上元最低血量键", "xl_low": "翔舞最低血量键",
                   "wm1": "王母普通键", "fx1": "风袖普通键", "bl1": "婆罗门普通键"}
 
+FEITIAN_GROUPS = (
+    (("ft_toggle", "刷血总开关", "f3"), ("ft_begin", "非橙武爆发", "f4"),
+     ("ft_confirm", "通用确认／恢复", "f5")),
+    (("ft_pet", "蝶鸾（宠物栏）", "f10"), ("ft_heal", "醉舞九天", "f11"),
+     ("ft_target_key", "选择最低血量队友", "f12")),
+    (("ft_self", "选择自己", "f1"), ("ft_snake", "灵蛇引", "1"), ("ft_scorpion", "圣蝎引", "2")),
+    (("ft_sacrifice", "蛊虫献祭", "3"), ("ft_nuwa", "女娲补天", "4"), ("ft_butterfly", "碧蝶引", "5")),
+)
+DEFAULTS.update({key: default for group in FEITIAN_GROUPS for key, _, default in group})
+DEFAULTS.update(school="yunchang", ft_loop_ms="100", ft_burst_ms="1500", ft_plant="")
+DEFAULTS.update(ft_use_macro="0", ft_macro_key="")
+CW_FIELDS = (("ft_cw_begin", "橙武爆发触发键"), ("ft_weapon", "游戏：橙武特效"),
+             ("ft_shengshou", "游戏：圣手织天"))
+DEFAULTS.update(dict.fromkeys((key for key, _ in CW_FIELDS), ""))
+
+
+def feitian_steps(cfg, group):
+    delay = float(cfg["ft_loop_ms" if group == 1 else "ft_burst_ms"]) / 1000
+    return tuple((cfg[key], delay if i else 0.0)
+                 for i, (key, _, _) in enumerate(FEITIAN_GROUPS[group]))
+
+
+def cw_finisher(cfg):
+    gap = float(cfg["ft_loop_ms"]) / 1000
+    steps = [(cfg["ft_weapon"], 0), (cfg["ft_target_key"], gap)]
+    for index in range(4):
+        steps.append((cfg["ft_shengshou"], gap if index == 0 else max(gap, 2 - 3 * gap)))
+        steps.extend((cfg[key], gap) for key in ("ft_pet", "ft_heal", "ft_target_key"))
+    return tuple(steps)
+
 
 def normalize_key(key: str) -> str:
     return (key or "").strip().lower()
@@ -54,13 +84,46 @@ def write_config_file(path: Path, data: dict[str, str]) -> None:
 
 def validate_config(data: dict[str, str]) -> dict[str, str]:
     cfg = {**DEFAULTS, **data}
+    if cfg["school"] not in {"yunchang", "feitian"}:
+        raise ValueError("请选择有效的流派。")
+    used_feitian = {}
+    if cfg["ft_use_macro"] not in {"0", "1"}:
+        raise ValueError("请选择有效的爆发模式。")
+    macro_mode = cfg["ft_use_macro"] == "1"
+    for group in FEITIAN_GROUPS:
+        for field, label, _ in group:
+            key = cfg[field] = normalize_key(cfg[field])
+            if macro_mode and group in FEITIAN_GROUPS[2:] and field != "ft_self":
+                continue
+            if not key or key not in KEY_OPTIONS:
+                raise ValueError(f"请设置飞天承华的{label}按键。")
+            if key in used_feitian:
+                raise ValueError(f"飞天承华：{label}与{used_feitian[key]}不能使用同一个按键。")
+            used_feitian[key] = label
+    optional = (("ft_plant", "迷仙引梦"), *CW_FIELDS)
+    if macro_mode:
+        if not normalize_key(cfg["ft_macro_key"]):
+            raise ValueError("请设置游戏内爆发宏快捷键。")
+        optional += (("ft_macro_key", "游戏内爆发宏"),)
+    for field, label in optional:
+        key = cfg[field] = normalize_key(cfg[field])
+        if key not in KEY_OPTIONS:
+            raise ValueError(f"请选择有效的{label}快捷键。")
+        if key in used_feitian:
+            raise ValueError(f"{label}与{used_feitian[key]}不能使用同一个按键。")
+        if key:
+            used_feitian[key] = label
+    if cfg["ft_cw_begin"] and not (cfg["ft_weapon"] and cfg["ft_shengshou"]):
+        raise ValueError("设置橙武爆发触发键后，请同时绑定橙武特效和圣手织天。")
     for field in KEY_FIELDS:
         cfg[field] = normalize_key(cfg[field])
         if cfg[field] not in KEY_OPTIONS:
             raise ValueError(f"不支持的按键：{cfg[field]}")
     if not cfg["toggle"]:
         raise ValueError("请设置总开关键。")
-    for field, label, minimum, maximum in (("delay_ms", "接回雪延迟(ms)", 0, 60000),
+    for field, label, minimum, maximum in (("ft_loop_ms", "刷血按键间隔(ms)", 10, 60000),
+                                           ("ft_burst_ms", "爆发按键间隔(ms)", 10, 60000),
+                                           ("delay_ms", "接回雪延迟(ms)", 0, 60000),
                                            ("target_delay_ms", "选人后等待(ms)", 0, 60000),
                                            ("loop_interval_s", "二段回雪时间(s)", 0.05, 3600)):
         try:

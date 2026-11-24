@@ -4,20 +4,24 @@ from __future__ import annotations
 import configparser
 import queue
 import sys
+import time
 import tkinter as tk
 from contextlib import contextmanager
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox
 
-from app_config import (DEFAULTS, KEY_OPTIONS, SKILLS, TARGET_MODES, action_for,
+from app_config import (DEFAULTS, FEITIAN_GROUPS, TARGET_MODES, action_for, cw_finisher, feitian_steps,
                         hotkey_sets, normalize_key, read_config_file,
                         validate_config, write_config_file)
 from keyboard_hook import KeyboardHook
-from macro_engine import MacroEngine
+from key_capture import KeyCapture
+from desktop_ui import DesktopUI, configure_display
+from macro_engine import MacroEngine, PeriodicKey
 from pydd import DDError, PyDD
 from foreground_guard import ForegroundGuard
 from dd_lifecycle import DDDriverSession, StopRequestError, ensure_administrator, run_guardian
 from dd_device import RestartRequired
+from dd_install import ensure_dd_driver
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else BASE_DIR
@@ -25,9 +29,7 @@ RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))
 CONFIG_FILE = APP_DIR / "config.ini"
 BUNDLED_CONFIG_FILE = RESOURCE_DIR / "config.ini"
 DD_DLL = RESOURCE_DIR / "ddhid.63340.dll"
-BG_MAIN, BG_CARD = "#2c2622", "#3d352e"
-COLOR_TITLE, COLOR_TEXT = "#f7d96b", "#e0c8a0"
-COLOR_STOP, COLOR_RUN = "#ff7777", "#8fff8f"
+COLOR_TITLE, COLOR_STOP, COLOR_RUN = "#654470", "#8b424d", "#246452"
 
 
 def load_config():
@@ -85,17 +87,17 @@ class YanziHelper:
         except (OSError, configparser.Error, UnicodeError, ValueError) as exc:
             self.config_load_failed = True
             config_error = f"读取配置失败：{exc}"
-        root.title("YanziHelper")
-        root.geometry("740x780")
-        root.minsize(740, 780)
-        root.configure(bg=BG_MAIN)
+        root.title("妍姿助手")
         icon = RESOURCE_DIR / "24983.png"
         if icon.exists():
             try:
                 root.iconphoto(False, tk.PhotoImage(file=str(icon)))
             except tk.TclError:
                 pass
-        self.create_ui()
+        self.key_capture = KeyCapture(self)
+        self.view = DesktopUI(self, RESOURCE_DIR)
+        for box in self.key_combos.values():
+            self.key_capture.bind(box)
         self.refresh_hotkey_cache()
         if start_listener:
             try:
@@ -107,101 +109,21 @@ class YanziHelper:
         self.poll_events()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def label(self, parent, text, **kwargs):
-        return tk.Label(parent, text=text, bg=BG_CARD, fg=COLOR_TEXT, font=("微软雅黑", 10), **kwargs)
+    def select_school(self, school):
+        if (school == self.view.school or self.macro_enabled or self.stopping or self.closing
+                or self.profile_dialog_active or self.pending_enable_config is not None):
+            return
+        self.key_capture.cancel()
+        self.view.select(school)
+        self.refresh_hotkey_cache()
 
-    def create_ui(self):
-        main = tk.Frame(self.root, bg=BG_MAIN, padx=20, pady=14)
-        main.pack(fill="both", expand=True)
-        tk.Label(main, text="YanziHelper", font=("微软雅黑", 18, "bold"), bg=BG_MAIN,
-                 fg=COLOR_TITLE).pack(pady=(0, 5))
-        self.status_label = tk.Label(main, text="● 已停止", font=("微软雅黑", 11),
-                                    bg=BG_MAIN, fg=COLOR_STOP, wraplength=680)
-        self.status_label.pack(pady=(0, 8))
-        timing = tk.Frame(main, bg=BG_CARD)
-        timing.pack(fill="x", pady=(0, 8))
-        self.label(timing, "总开关").grid(row=0, column=0, sticky="w", padx=10, pady=7)
-        self.make_combo(timing, "toggle", 0, 1)
-        self.make_entry(timing, "delay_ms", "接回雪延迟(ms)", 0, 2)
-        self.make_entry(timing, "loop_interval_s", "二段回雪时间(s)", 1, 0)
-        self.make_entry(timing, "target_delay_ms", "选人后等待(ms)", 1, 2)
-        skills = tk.Frame(main, bg=BG_CARD)
-        skills.pack(fill="x", pady=(0, 8))
-        for col, text in enumerate(("技能", "普通触发键", "游戏第二快捷键", "最低血量专用触发键")):
-            self.label(skills, text).grid(row=0, column=col, padx=10, pady=(8, 4), sticky="w")
-        for row, (name, prefix) in enumerate(SKILLS, 1):
-            self.label(skills, name).grid(row=row, column=0, sticky="w", padx=10, pady=5)
-            self.make_combo(skills, f"{prefix}1", row, 1)
-            self.make_combo(skills, f"{prefix}2", row, 2)
-            if prefix in {"sy", "xl"}:
-                self.make_combo(skills, f"{prefix}_low", row, 3)
-            else:
-                self.label(skills, "—").grid(row=row, column=3)
-        target = tk.Frame(main, bg=BG_CARD)
-        target.pack(fill="x", pady=(0, 8))
-        self.label(target, "上元／翔舞普通键选人模式").grid(row=0, column=0, sticky="w", padx=10, pady=7)
-        self.cb_target_mode = ttk.Combobox(target, values=list(TARGET_MODES.values()), state="readonly", width=14)
-        self.cb_target_mode.set(TARGET_MODES.get(self.cfg["target_mode"], self.cfg["target_mode"]))
-        self.cb_target_mode.grid(row=0, column=1, padx=6, pady=6, sticky="w")
-        self.cb_target_mode.bind("<<ComboboxSelected>>", lambda event: self.update_target_state())
-        self.all_combos.append(self.cb_target_mode)
-        self.label(target, "游戏：选择最低血量").grid(row=1, column=0, sticky="w", padx=10, pady=5)
-        self.make_combo(target, "target_low_key", 1, 1)
-        self.label(target, "游戏：选择盟友").grid(row=2, column=0, sticky="w", padx=10, pady=5)
-        self.make_combo(target, "target_ally_key", 2, 1)
-        self.ally_hx_low = tk.BooleanVar(value=self.cfg["ally_hx_low"] == "1")
-        self.ally_check = tk.Checkbutton(target, text="选盟友铺 HOT 后，回雪前切到最低血量", variable=self.ally_hx_low,
-                                        bg=BG_CARD, fg=COLOR_TEXT, selectcolor="#554a42", activebackground=BG_CARD,
-                                        activeforeground=COLOR_TEXT, font=("微软雅黑", 10))
-        self.ally_check.grid(row=3, column=0, columnspan=3, padx=7, pady=(3, 8), sticky="w")
-        self.update_target_state()
-        buttons = tk.Frame(main, bg=BG_MAIN)
-        buttons.pack(fill="x", pady=(0, 6))
-        for text, command in (("保存当前", self.save_current_config), ("导出配置", self.export_config),
-                              ("导入配置", self.import_config)):
-            button = tk.Button(buttons, text=text, command=command, font=("微软雅黑", 9), bg="#554a42", fg="white",
-                               activebackground="#6a5b4f", activeforeground="white", bd=0, padx=12, pady=6)
-            button.pack(side="left", padx=(0, 8))
-            self.config_buttons.append(button)
-        self.foreground_guard_enabled = tk.BooleanVar(value=self.cfg["foreground_guard"] == "1")
-        self.foreground_check = tk.Checkbutton(
-            buttons, text="前台保护（在游戏窗口按开关）", variable=self.foreground_guard_enabled,
-            bg=BG_MAIN, fg=COLOR_TEXT, selectcolor="#554a42", activebackground=BG_MAIN,
-            activeforeground=COLOR_TEXT, font=("微软雅黑", 9))
-        self.foreground_check.pack(side="right")
-        self.config_buttons.append(self.foreground_check)
-        for tip in (
-            "上元、翔舞：普通键按所选模式选人；专用键始终先选最低血量。空白表示未设置。",
-            "短按施放一次并接回雪；长按重复，松开停止重复。专用键也使用同一游戏第二快捷键。",
-            "回雪、风袖、王母、婆罗门沿用原有操作；游戏选人键须与游戏内设置一致。",
-            "选盟友由游戏决定循环顺序，可能重复选人；鼠标右键方案暂未启用。",
-        ):
-            tk.Label(main, text=tip, bg=BG_MAIN, fg=COLOR_TEXT, font=("微软雅黑", 9),
-                     justify="left", wraplength=690).pack(anchor="w", pady=2)
-        tk.Label(main, text="原作者：@小柴胡。优化使用：@汜水月白。", bg=BG_MAIN,
-                 fg=COLOR_TITLE, font=("微软雅黑", 9)).pack(anchor="w", pady=(6, 0))
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TCombobox", fieldbackground="#554a42", background="#554a42", foreground="white")
-        style.map("TCombobox", fieldbackground=[("readonly", "#554a42")], foreground=[("readonly", "white")])
-
-    def make_combo(self, parent, key, row, column):
-        cb = ttk.Combobox(parent, values=KEY_OPTIONS, width=10, state="readonly")
-        cb.set(self.cfg[key])
-        cb.grid(row=row, column=column, padx=6, pady=5, sticky="w")
-        cb.bind("<<ComboboxSelected>>", lambda event: self.refresh_hotkey_cache())
-        self.key_combos[key] = cb
-        setattr(self, f"cb_{key}", cb)
-        self.all_combos.append(cb)
-        return cb
-
-    def make_entry(self, parent, key, text, row, column):
-        self.label(parent, text).grid(row=row, column=column, sticky="w", padx=10, pady=6)
-        entry = tk.Entry(parent, font=("微软雅黑", 10), width=10, bg="#554a42", fg="white", bd=0)
-        entry.insert(0, self.cfg[key])
-        entry.grid(row=row, column=column + 1, padx=6, pady=6, sticky="w")
-        self.entries[key] = entry
-        self.all_entries.append(entry)
+    def update_macro_fields(self):
+        macro = self.use_game_macro.get()
+        self.cb_ft_macro_key.config(state="readonly" if macro else "disabled")
+        for group in FEITIAN_GROUPS[2:]:
+            for field, _, _ in group:
+                if field != "ft_self":
+                    self.key_combos[field].config(state="disabled" if macro else "readonly")
 
     def update_target_state(self):
         state = "normal" if (not self.macro_enabled and not self.stopping and self.pending_enable_config is None and
@@ -209,10 +131,13 @@ class YanziHelper:
         self.ally_check.config(state=state)
 
     def set_all_state(self, enable):
+        self.view.lock_navigation(not enable)
         for combo in self.all_combos:
             combo.config(state="readonly" if enable else "disabled")
         for widget in self.all_entries + self.config_buttons:
             widget.config(state="normal" if enable else "disabled")
+        if enable:
+            self.update_macro_fields()
         self.update_target_state()
 
     def collect_config(self):
@@ -222,12 +147,18 @@ class YanziHelper:
         data["target_mode"] = next((key for key, label in TARGET_MODES.items() if label == mode), mode)
         data["ally_hx_low"] = "1" if self.ally_hx_low.get() else "0"
         data["foreground_guard"] = "1" if self.foreground_guard_enabled.get() else "0"
+        data["school"] = self.view.school
+        data["ft_use_macro"] = "1" if self.use_game_macro.get() else "0"
         return data
 
     def apply_config(self, data):
+        self.key_capture.cancel()
         merged = {**DEFAULTS, **data}
+        self.view.select(merged["school"])
+        self.use_game_macro.set(merged["ft_use_macro"] == "1")
+        self.update_macro_fields()
         for key, cb in self.key_combos.items():
-            cb.set(merged[key])
+            cb.set(merged[key].upper())
         for key, entry in self.entries.items():
             entry.delete(0, tk.END)
             entry.insert(0, merged[key])
@@ -303,6 +234,7 @@ class YanziHelper:
         # Native file dialogs run a nested event loop. Suspend the global toggle
         # too, so typing a filename cannot enable output or queue a later enable.
         self.profile_dialog_active = True
+        self.key_capture.cancel()
         self.refresh_hotkey_cache()
         self.discard_pending_presses()
         try:
@@ -314,16 +246,28 @@ class YanziHelper:
 
     def refresh_hotkey_cache(self):
         cfg = self.active_config if self.macro_enabled else self.collect_config()
-        suppressed, watched = hotkey_sets(cfg)
-        suspended = self.profile_dialog_active or self.closing
-        self.hook.configure("" if suspended else cfg["toggle"], suppressed, watched,
+        if cfg["school"] == "feitian":
+            toggle = cfg["ft_toggle"]
+            suppressed, watched = {cfg["ft_begin"], cfg["ft_confirm"]}, set()
+            if cfg["ft_cw_begin"]:
+                suppressed.add(cfg["ft_cw_begin"])
+        else:
+            toggle = cfg["toggle"]
+            suppressed, watched = hotkey_sets(cfg)
+        suspended = self.profile_dialog_active or self.key_capture.active or self.closing
+        self.hook.configure("" if suspended else toggle, suppressed, watched,
                             self.macro_enabled and not suspended)
 
     def stop_macro(self, error=""):
+        self.key_capture.cancel()
         self.macro_enabled = False
         self.pending_enable_config = None
         self.stop_error = error
         self.refresh_hotkey_cache()
+        if error:
+            # A toggle queued before focus loss or an output fault belongs to
+            # the old run. It cannot authorize starting in a different window.
+            self.discard_pending_presses()
         self.stopping = self.engine is not None and not self.engine.stop()
         if self.stopping:
             self.set_all_state(False)
@@ -338,7 +282,7 @@ class YanziHelper:
         self.status_label.config(text=f"● 错误：{self.stop_error}" if self.stop_error else "● 已停止", fg=COLOR_STOP)
 
     def toggle_macro(self):
-        if self.closing or self.stopping or self.profile_dialog_active:
+        if self.closing or self.stopping or self.profile_dialog_active or self.key_capture.active:
             return
         if self.macro_enabled or self.pending_enable_config is not None:
             self.stop_macro()
@@ -350,7 +294,6 @@ class YanziHelper:
                 self.foreground_guard.capture()
             else:
                 self.foreground_guard.clear()
-            # Opening settings alone must not initialize the input driver.
             if self.device_session is not None:
                 self.device_session.check_alive()
             if self.dd is None:
@@ -379,7 +322,52 @@ class YanziHelper:
         self.refresh_hotkey_cache()
         self.set_all_state(False)
         self.status_label.config(text="● 运行中", fg=COLOR_RUN)
+        if cfg["school"] == "feitian":
+            self.ft_plant_timer = PeriodicKey(cfg["ft_plant"], 20, time.monotonic()) if cfg["ft_plant"] else None
+            self.start_feitian_phase(1)
         play_sound("start.wav")
+
+    def start_feitian_phase(self, phase):
+        cfg = self.active_config
+        self.ft_phase = phase
+        trigger = f"feitian-{phase}"
+        steps = cw_finisher(cfg) if phase == 4 else feitian_steps(cfg, phase)
+        self.engine.submit(trigger, steps, phase == 1, float(cfg["ft_loop_ms"]) / 1000,
+                           periodic=self.ft_plant_timer if phase == 1 else None)
+        if phase != 1:
+            self.engine.release(trigger)
+        status = {1: "常态刷血", 2: "召宠中 · 看到圣蝎后再按当前爆发键",
+                  3: "献祭并召蝶 · 看到碧蝶后再按当前爆发键", 4: "橙武特效 · 圣手爆菜"}
+        self.status_label.config(text="● " + status[phase], fg=COLOR_RUN)
+
+    def feitian_press(self, key):
+        cfg = self.active_config
+        if self.ft_phase == 1 and key and key in (cfg["ft_begin"], cfg["ft_cw_begin"]):
+            self.ft_burst_key = key
+            self.engine.release("feitian-1")
+            if cfg["ft_use_macro"] == "1":
+                self.send_game_macro()
+            else:
+                self.start_feitian_phase(2)
+        elif self.ft_phase == "game_macro" and self.engine.idle:
+            if key == self.ft_burst_key:
+                self.send_game_macro()
+            elif key == cfg["ft_confirm"]:
+                self.start_feitian_phase(4 if self.ft_burst_key == cfg["ft_cw_begin"] else 1)
+        elif self.ft_phase in (2, 3) and key in (cfg["ft_confirm"], self.ft_burst_key) and self.engine.idle:
+            if self.ft_phase == 2:
+                self.start_feitian_phase(3)
+            elif self.ft_phase == 3:
+                self.start_feitian_phase(4 if self.ft_burst_key == cfg["ft_cw_begin"] else 1)
+
+    def send_game_macro(self):
+        cfg = self.active_config
+        self.ft_phase = "game_macro"
+        # Key presses last 40 ms. Eleven taps spaced by 100 ms run for about 1.5 s.
+        steps = ((cfg["ft_self"], 0),) + ((cfg["ft_macro_key"], 0.1),) * 11
+        self.engine.submit("game_macro", steps)
+        self.engine.release("game_macro")
+        self.status_label.config(text="● 游戏宏爆发 · 看到碧蝶按通用确认键，未出蝶可重按爆发键", fg=COLOR_RUN)
 
     def poll_events(self):
         if self.closing:
@@ -409,17 +397,26 @@ class YanziHelper:
             elif event == "recovered" and self.pending_enable_config is not None and self.engine.ready:
                 self.enable_config(self.pending_enable_config)
             elif event == "press":
-                if self.profile_dialog_active:
+                if self.profile_dialog_active or self.key_capture.active:
                     continue
-                if value == (self.active_config["toggle"] if self.macro_enabled else normalize_key(self.cb_toggle.get())):
+                cfg = self.active_config if self.macro_enabled else self.collect_config()
+                if value == cfg["ft_toggle" if cfg["school"] == "feitian" else "toggle"]:
                     self.toggle_macro()
+                elif self.macro_enabled and cfg["school"] == "feitian":
+                    self.feitian_press(value)
                 elif self.macro_enabled:
                     action = action_for(self.active_config, value)
                     if action:
                         steps, repeat, interval = action
-                        self.engine.submit(value, steps, repeat, interval)
+                        if self.engine.submit(value, steps, repeat, interval):
+                            sequence = " → ".join(key.upper() for key, _ in steps)
+                            self.status_label.config(
+                                text=f"● 运行中 · 已收到 {value.upper()}，已提交 {sequence}", fg=COLOR_RUN)
             elif event == "release" and self.engine:
                 self.engine.release(value)
+        if (self.macro_enabled and self.active_config["school"] == "feitian"
+                and self.ft_phase == 4 and self.engine.idle and self.engine.ready):
+            self.start_feitian_phase(1)
         self.poll_id = self.root.after(10, self.poll_events)
 
     def on_close(self):
@@ -433,9 +430,9 @@ class YanziHelper:
             self.poll_id = None
         try:
             if not self.config_load_failed:
-                save_config(self.collect_config())
-        except OSError as exc:
-            messagebox.showerror("配置保存失败", f"{exc}\n程序仍会完成退出清理。", parent=self.root)
+                save_config(validate_config(self.collect_config()))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("配置保存失败", f"{exc}\n本次编辑未保存，已有配置文件会保留。程序将继续退出。", parent=self.root)
         self.finish_close()
 
     def finish_close(self):
@@ -449,8 +446,8 @@ class YanziHelper:
         if self.dd:
             try:
                 self.dd.close()
-            except DDError as exc:
-                self.status_label.config(text=f"● 正在重试释放按键与驱动：{exc}", fg=COLOR_STOP)
+            except (DDError, OSError) as exc:
+                self.status_label.config(text=f"● 正在重试释放按键与 DD 驱动：{exc}", fg=COLOR_STOP)
                 self.root.after(self.close_retry_ms, self.finish_close)
                 self.close_retry_ms = min(self.close_retry_ms * 2, 2000)
                 return
@@ -467,8 +464,12 @@ class YanziHelper:
                                      f"{exc}\n程序将退出，由独立监护进程继续尝试停用。"
                                      "当前尚未确认驱动停止；请检查 dd-driver-status.json，必要时重启系统。",
                                      parent=self.root)
+            except RestartRequired:
+                messagebox.showerror("DD 停用需要重启",
+                                     "如需游玩其他游戏，请先重启电脑，确保 DD 驱动完全停止。",
+                                     parent=self.root)
             except DDError as exc:
-                messagebox.showerror("DD 停用需要重启" if isinstance(exc, RestartRequired) else "DD 驱动尚未确认停止",
+                messagebox.showerror("DD 驱动尚未确认停止",
                                      f"{exc}\n请查看程序目录的 dd-driver-status.json；必要时重启系统。",
                                      parent=self.root)
         try:
@@ -481,26 +482,36 @@ class YanziHelper:
 
 
 def main():
-    if len(sys.argv) == 6 and sys.argv[1] == "--dd-guardian":
+    mode = sys.argv[1] if len(sys.argv) > 1 else None
+    if len(sys.argv) == 6 and mode == "--dd-guardian":
         raise SystemExit(run_guardian(int(sys.argv[2]), int(sys.argv[3]),
                                      Path(sys.argv[4]), Path(sys.argv[5])))
-    if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+    if len(sys.argv) == 3 and mode == "--self-test":
         from app_selftest import run
+        configure_display()
         raise SystemExit(run(Path(sys.argv[2])))
-    if len(sys.argv) == 3 and sys.argv[1] == "--dd-lifecycle-check":
+    if len(sys.argv) == 3 and mode == "--dd-lifecycle-check":
         from dd_lifecycle_check import run
         raise SystemExit(run(Path(sys.argv[2])))
     try:
         if not ensure_administrator():
             return
-    except DDError as exc:
+    except (DDError, OSError) as exc:
         messagebox.showerror("无法启动", str(exc))
         return
+    configure_display()
     root = tk.Tk()
     root.withdraw()
     app = None
-    device_session = DDDriverSession(Path(__file__), APP_DIR / "dd-driver-status.json")
+    device_session = None
     try:
+        if not ensure_dd_driver(APP_DIR / "driver", lambda: messagebox.askyesno(
+                "安装 DD 驱动",
+                "未检测到 DD HID 63340 驱动。妍姿助手需要安装随包附带的 DD 虚拟键盘驱动才能运行。\n\n"
+                "是否现在安装？安装完成后将继续启动妍姿助手。",
+                default="no", parent=root)):
+            return
+        device_session = DDDriverSession(Path(__file__), APP_DIR / "dd-driver-status.json")
         device_session.start()
         app = YanziHelper(root, device_session=device_session)
         root.deiconify()
@@ -508,27 +519,25 @@ def main():
     except (DDError, OSError) as exc:
         messagebox.showerror("助手启动或运行失败", str(exc), parent=root)
     finally:
-        # Also cover unexpected mainloop termination; never unload under a sender.
-        if app is not None:
+        # Normal window closure waits for the guardian in finish_close(). If
+        # mainloop exits early, release the sender before requesting shutdown.
+        request_stop = app is None
+        if app is None:
+            root.destroy()
+        elif not app.closed:
             app.hook.close()
-            stopped = app.engine is None or app.engine.close()
-            if stopped and app.dd is not None:
+            request_stop = app.engine is None or app.engine.close()
+            if request_stop and app.dd is not None:
                 try:
                     app.dd.close()
-                except DDError:
-                    # Normal window closing retries visibly in finish_close().
-                    # Do not replace an unrelated mainloop exception here.
-                    pass
-            request_stop = stopped
-        else:
-            request_stop = True
-        if request_stop:
+                except (DDError, OSError):
+                    # The guardian also watches the parent process handle.
+                    request_stop = False
+        if request_stop and device_session is not None:
             try:
                 device_session.request_stop()
             except DDError:
-                # A failed IPC write must not prevent the parent from exiting:
-                # the guardian also watches this process handle independently.
-                pass
+                pass  # Parent exit also signals the guardian if IPC has failed.
 
 
 if __name__ == "__main__":

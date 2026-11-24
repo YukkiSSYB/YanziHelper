@@ -13,14 +13,15 @@
 | pydd.py | DD-01 | DD-02：按下/抬起与 DLL 关闭同步 |
 | YanziHelper.py | UI-01 | UI-02：配置对话框期间暂停总开关 |
 
-两份快照均记录同一组 9 个运行模块（上表 8 个模块及 `app_selftest.py`）。路径相对于仓库根目录，SHA-256 针对源码文件的原始字节；Python 源码按 [.gitattributes](../.gitattributes) 使用 LF，与 Git 保存的文件内容一致。它们不记录 EXE、ZIP 或第三方驱动的指纹。
+前两份快照记录上表 8 个模块及 `app_selftest.py`。2026-11-24 快照同时记录新版界面、键位录入、DD 安装入口和生命周期检查模块。路径相对于仓库根目录，SHA-256 按 Git 保存的文件字节计算。Python 源码按 [.gitattributes](../.gitattributes) 使用 LF。
 
 | 版本 | 快照 | 核验对象 |
 | --- | --- | --- |
 | 首次源码发布 | [SOURCE_PROVENANCE.json](../SOURCE_PROVENANCE.json) | 首次提交 `86d6e1271d97d7fc6539da097cfd711d915da9b1` 中的源码 |
-| 2026-11-15 更新 | [SOURCE_PROVENANCE-2026-11-15.json](SOURCE_PROVENANCE-2026-11-15.json) | 本次更新的源码；本版检出后可直接按相对路径核验 |
+| 2026-11-15 更新 | [SOURCE_PROVENANCE-2026-11-15.json](SOURCE_PROVENANCE-2026-11-15.json) | 提交 `9feb5589e1a6fdaeda505e6e628c0f7f3fb0f39f` 中的源码 |
+| 2026-11-24 更新 | [SOURCE_PROVENANCE-2026-11-24.json](SOURCE_PROVENANCE-2026-11-24.json) | 本版检出后的源码 |
 
-在仓库根目录用 PowerShell 运行以下示例（需要 Python 3 和 Git）。它从 Git 历史读取首次版本，从工作目录读取本次版本；不会切换分支或修改文件。
+在仓库根目录用 PowerShell 运行以下示例（需要 Python 3 和 Git）。示例从 Git 历史核验前两版，从工作目录核验本版。
 
 ```powershell
 @'
@@ -42,11 +43,12 @@ def verify(snapshot, revision=None):
     print(f"OK: {snapshot} ({len(files)} files)")
 
 verify("SOURCE_PROVENANCE.json", "86d6e1271d97d7fc6539da097cfd711d915da9b1")
-verify("docs/SOURCE_PROVENANCE-2026-11-15.json")
+verify("docs/SOURCE_PROVENANCE-2026-11-15.json", "9feb5589e1a6fdaeda505e6e628c0f7f3fb0f39f")
+verify("docs/SOURCE_PROVENANCE-2026-11-24.json")
 '@ | python -
 if ($LASTEXITCODE -ne 0) { throw '来源快照核验失败。' }
 ```
 
-今后源码改动后，可给第二个 `verify()` 同样传入 2026-11-15 更新对应的 Git 提交，核验该提交的快照及源码，而不依赖当时的工作目录。新版本另存新快照，不覆盖旧记录。
+后续可给最后一个 `verify()` 传入 2026-11-24 更新对应的 Git 提交，核验该提交中的快照和源码。新版本另存一份快照。
 
 快照时间是生成指纹的时间，不是原始创作时间。公开仓库首次接收提交的时间、提交内容及独立保存的历史记录可帮助核对某版本何时已公开存在；本地 Git 作者时间、注释和自行生成的哈希均不能单独证明最早创作权属。

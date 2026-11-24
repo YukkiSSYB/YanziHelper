@@ -23,6 +23,8 @@ if (-not $TestOnly) {
     $driver = (Resolve-Path -LiteralPath $DriverDirectory).ProviderPath
     $report = Get-Content -LiteralPath (Join-Path $release 'selftest-result.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($report.status -cne 'PASS' -or $report.frozen -isnot [bool] -or -not $report.frozen -or
+        $report.input_backend -cne 'PyDD' -or
+        $report.real_input_sent -isnot [bool] -or $report.real_input_sent -or
         $report.real_driver_loaded -isnot [bool] -or $report.real_driver_loaded -or
         $report.global_hook_started -isnot [bool] -or $report.global_hook_started) {
         throw 'The release has not passed its packaged self-test.'

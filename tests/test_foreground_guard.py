@@ -1,6 +1,9 @@
+import tkinter as tk
 import unittest
 from unittest.mock import Mock, patch
 
+import YanziHelper as app
+from app_config import DEFAULTS
 from foreground_guard import ForegroundGuard
 
 
@@ -48,6 +51,33 @@ class ForegroundGuardTests(unittest.TestCase):
         self.assertFalse(self.guard.allows_output())
         self.guard.capture()
         self.assertTrue(self.guard.allows_output())
+
+
+class ForegroundToggleTests(unittest.TestCase):
+    def test_focus_loss_discards_an_already_queued_toggle(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        cfg = {**DEFAULTS, "foreground_guard": "1"}
+        reader = Mock(return_value=(100, 101))
+        with patch.object(app, "load_config", return_value=cfg), patch.object(app, "play_sound"):
+            ui = app.YanziHelper(root, Mock(), start_listener=False)
+            ui.foreground_guard = ForegroundGuard(reader, own_pid=999)
+            ui.toggle_macro()
+            self.addCleanup(ui.engine.close)
+            ui.events.put(("press", cfg["toggle"]))
+            reader.return_value = (200, 201)
+            root.after_cancel(ui.poll_id)
+            ui.poll_events()
+            root.after_cancel(ui.poll_id)
+            self.assertFalse(ui.macro_enabled)
+            self.assertIn("目标窗口已离开前台", ui.stop_error)
+
+            reader.return_value = (100, 101)
+            ui.events.put(("press", cfg["toggle"]))
+            ui.poll_events()
+            root.after_cancel(ui.poll_id)
+            self.assertTrue(ui.macro_enabled)
 
 
 if __name__ == "__main__":

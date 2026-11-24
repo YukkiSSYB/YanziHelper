@@ -4,6 +4,7 @@ import configparser
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -32,6 +33,7 @@ class ReleaseTests(unittest.TestCase):
         report = {
             "status": "PASS", "frozen": True,
             "real_driver_loaded": False, "global_hook_started": False,
+            "real_input_sent": False, "input_backend": "PyDD",
             "executable_sha256": package.sha256_file(candidate / package.EXE_NAME),
             "bundled_config_sha256": package.sha256_file(config),
         }
@@ -57,6 +59,16 @@ class ReleaseTests(unittest.TestCase):
                   for path in release.rglob("*") if path.is_file()} if release.exists() else None)
         archive = project / package.ARCHIVE_NAME
         return files, archive.read_bytes() if archive.exists() else None
+
+    def driver_fixture(self):
+        folder = self.project / "vendor" / "ddhid63340"
+        folder.mkdir(parents=True)
+        hashes = {}
+        for name in ("ddc.exe", "ddhid63340.sys", "ddhid63340.inf", "ddhid63340.cat"):
+            path = folder / name
+            path.write_text(f"mock DD payload: {name}", encoding="utf-8")
+            hashes[name] = package.sha256_file(path)
+        return folder, hashes
 
     def test_actual_configuration_rejects_missing_unrelated_malformed_and_conflicting_files(self):
         profile = self.project / "config.ini"
@@ -88,6 +100,33 @@ class ReleaseTests(unittest.TestCase):
         candidate, config = self.fixture(existing=False)
         package.publish_release(self.project, candidate, config)
         self.assertEqual((self.project / "release" / "config.ini").read_bytes(), config.read_bytes())
+
+    def test_minimal_driver_zip_contains_only_app_config_and_vendor_driver(self):
+        candidate, config = self.fixture()
+        vendor, hashes = self.driver_fixture()
+        (vendor / "unused.txt").write_text("unrelated file", encoding="utf-8")
+        before = self.snapshot()
+        with patch("dd_install.DRIVER_FILES", hashes):
+            archive = package.publish_minimal_driver_release(self.project, candidate, config, vendor)
+        self.assertEqual(archive, self.project / package.MINIMAL_DRIVER_ARCHIVE_NAME)
+        self.assertEqual(self.snapshot(), before)
+        with ZipFile(archive) as result:
+            self.assertEqual(result.namelist(), [package.EXE_NAME, "config.ini", *(f"driver/{name}" for name in hashes)])
+            self.assertEqual(result.read(package.EXE_NAME), (candidate / package.EXE_NAME).read_bytes())
+            self.assertEqual(result.read("config.ini"), before[0]["config.ini"])
+            for name in hashes:
+                self.assertEqual(result.read(f"driver/{name}"), (vendor / name).read_bytes())
+
+    def test_minimal_driver_rejects_modified_payload_without_replacing_previous_zip(self):
+        candidate, config = self.fixture(existing=False)
+        vendor, hashes = self.driver_fixture()
+        (vendor / "ddc.exe").write_bytes(b"modified installer")
+        archive = self.project / package.MINIMAL_DRIVER_ARCHIVE_NAME
+        archive.write_bytes(b"previous minimal archive")
+        with patch("dd_install.DRIVER_FILES", hashes), self.assertRaisesRegex(ValueError, "ddc.exe"):
+            package.publish_minimal_driver_release(self.project, candidate, config, vendor)
+        self.assertEqual(archive.read_bytes(), b"previous minimal archive")
+        self.assertEqual(self.snapshot(), (None, None))
 
     def test_each_failed_commit_move_restores_both_old_artifacts(self):
         for failing_move in range(1, 5):
@@ -162,6 +201,17 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             package.publish_release(self.project, candidate, config)
         self.assertEqual(self.snapshot(), before)
+
+    def test_driverless_or_unidentified_build_cannot_be_published_as_dd(self):
+        candidate, config = self.fixture()
+        report_path = candidate / package.REPORT_NAME
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        del report["input_backend"]
+        for variant in (report, {**report, "input_backend": "WindowsInput"}):
+            with self.subTest(backend=variant.get("input_backend")):
+                report_path.write_text(json.dumps(variant), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "packaged self-test"):
+                    package.validate_candidate(candidate, config)
 
     def test_invalid_preserved_profile_aborts_without_overwriting_it(self):
         candidate, config = self.fixture()
@@ -252,6 +302,7 @@ class PackagedSelfTestTests(unittest.TestCase):
         self.profile = self.folder / "config.ini"
         self.executable = self.folder / "YanziHelper.exe"
         self.executable.write_bytes(b"self-test executable identity")
+        self.dll = self.folder / "ddhid.63340.dll"
 
     def run_frozen(self):
         from app_selftest import run
@@ -259,8 +310,8 @@ class PackagedSelfTestTests(unittest.TestCase):
         with patch.object(sys, "frozen", True, create=True), \
                 patch.object(sys, "executable", str(self.executable)), \
                 patch.object(self.app, "BUNDLED_CONFIG_FILE", self.profile), \
-                patch.object(self.app, "RESOURCE_DIR", self.folder), \
-                patch.object(self.app, "DD_DLL", self.folder / "ddhid.63340.dll"):
+                patch.object(self.app, "DD_DLL", self.dll), \
+                patch.object(self.app, "RESOURCE_DIR", self.folder):
             result = run(report_path)
         return result, json.loads(report_path.read_text(encoding="utf-8"))
 
@@ -278,14 +329,16 @@ class PackagedSelfTestTests(unittest.TestCase):
     def test_hidden_selftest_binds_pass_to_executable_and_bundled_config(self):
         write_config_file(self.profile, {**DEFAULTS, "toggle": "f4"})
         original = self.profile.read_bytes()
-        (self.folder / "ddhid.63340.dll").write_bytes(b"placeholder; must never be loaded")
+        self.dll.write_bytes(b"placeholder; must never be loaded")
+        shutil.copytree(Path(package.__file__).resolve().parents[1] / "assets", self.folder / "assets")
         for filename in ("start.wav", "stop.wav"):
             with wave.open(str(self.folder / filename), "wb") as sound:
                 sound.setnchannels(1)
                 sound.setsampwidth(1)
                 sound.setframerate(8000)
                 sound.writeframes(b"\x80" * 80)
-        result, report = self.run_frozen()
+        with patch("app_selftest.HID_DLL_SHA256", package.sha256_file(self.dll)):
+            result, report = self.run_frozen()
         self.assertEqual(result, 0, report)
         self.assertEqual(report["status"], "PASS")
         self.assertEqual(report["executable_sha256"], package.sha256_file(self.executable))
@@ -293,6 +346,23 @@ class PackagedSelfTestTests(unittest.TestCase):
         self.assertEqual(self.profile.read_bytes(), original)
         self.assertFalse(report["real_driver_loaded"])
         self.assertFalse(report["global_hook_started"])
+        self.assertFalse(report["real_input_sent"])
+        self.assertEqual(report["input_backend"], "PyDD")
+        checks = {check["name"] for check in report["checks"]}
+        self.assertIn("bundled_page_backgrounds", checks)
+        self.assertIn("matching_hid_dll_bundled_without_loading", checks)
+
+    def test_missing_or_wrong_driver_in_frozen_bundle_fails_before_constructing_ui(self):
+        write_config_file(self.profile, DEFAULTS)
+        for payload in (None, b"wrong DLL"):
+            with self.subTest(payload=payload):
+                if payload is not None:
+                    self.dll.write_bytes(payload)
+                with patch("tkinter.Tk") as create_ui:
+                    result, report = self.run_frozen()
+                self.assertEqual(result, 1)
+                self.assertIn("ddhid.63340.dll", report["error"])
+                create_ui.assert_not_called()
 
 
 if __name__ == "__main__":

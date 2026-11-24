@@ -1,5 +1,6 @@
 param(
-    [string]$PythonExe = ''
+    [string]$PythonExe = '',
+    [switch]$CandidateOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,12 +35,12 @@ if (-not $PythonExe -or -not (Test-Path -LiteralPath $PythonExe -PathType Leaf))
 }
 $PythonExe = (Resolve-Path -LiteralPath $PythonExe).ProviderPath
 
-$requiredResources = @('ddhid.63340.dll', 'start.wav', 'stop.wav')
+$requiredResources = @('ddhid.63340.dll', 'start.wav', 'stop.wav', 'assets/yunshang.png', 'assets/feitian.png', 'assets/brand.png')
 $missingResources = @($requiredResources | Where-Object {
     -not (Test-Path -LiteralPath (Join-Path $projectDirectory $_) -PathType Leaf)
 })
 if ($missingResources.Count -gt 0) {
-    throw ('Required release resources are missing: ' + ($missingResources -join ', ') + '. Add the matching resource files described in README.md before building.')
+    throw ('Required release resources are missing: ' + ($missingResources -join ', ') + '. Add the matching resource files described in docs/BUILD.md before building.')
 }
 $configSource = Join-Path $projectDirectory 'config.ini'
 if (-not (Test-Path -LiteralPath $configSource -PathType Leaf)) {
@@ -58,7 +59,7 @@ try {
         throw 'The build configuration is invalid; release was not changed.'
     }
     $releaseConfig = Join-Path $releaseDirectory 'config.ini'
-    if (Test-Path -LiteralPath $releaseConfig) {
+    if (-not $CandidateOnly -and (Test-Path -LiteralPath $releaseConfig)) {
         & $PythonExe -B $packageTool --validate-config $releaseConfig
         if ($LASTEXITCODE -ne 0) {
             throw 'The preserved release configuration is invalid; release was not changed.'
@@ -97,8 +98,16 @@ try {
         throw "Packaged self-test failed with exit code $($selfTestProcess.ExitCode); release was not changed."
     }
     $report = Get-Content -LiteralPath $selfTestReport -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($report.status -ne 'PASS' -or $report.frozen -ne $true -or $report.real_driver_loaded -ne $false -or $report.global_hook_started -ne $false) {
+    if ($report.status -ne 'PASS' -or $report.frozen -ne $true -or $report.input_backend -ne 'PyDD' -or $report.real_input_sent -ne $false -or $report.real_driver_loaded -ne $false -or $report.global_hook_started -ne $false) {
         throw 'Packaged self-test did not confirm a safe PASS; release was not changed.'
+    }
+    if ($CandidateOnly) {
+        & $PythonExe -B $packageTool --verify-candidate $stagingDirectory --config $configSource
+        if ($LASTEXITCODE -ne 0) {
+            throw 'Candidate verification failed.'
+        }
+        Get-Item -LiteralPath $candidateExe | Select-Object FullName, Length, LastWriteTime
+        return
     }
     # Python verifies the tested EXE/configuration hashes, preserves the user's
     # release profile, assembles and checks ZIP, then commits both artifacts.

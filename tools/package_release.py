@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shutil
 import sys
+from tempfile import TemporaryDirectory
 import uuid
 from zipfile import ZipFile, ZIP_DEFLATED
 
@@ -22,6 +23,7 @@ from app_config import read_config_file, validate_config
 EXE_NAME = "YanziHelper.exe"
 REPORT_NAME = "selftest-result.json"
 ARCHIVE_NAME = "YanziHelper-新版.zip"
+MINIMAL_DRIVER_ARCHIVE_NAME = "YanziHelper-精简含驱动版-x64.zip"
 DOCUMENTS = ("使用说明.txt", "LICENSE", "NOTICE.md", "LICENSES/pydd-MIT.txt")
 
 
@@ -43,6 +45,8 @@ def validate_candidate(candidate: Path, config_source: Path) -> None:
     validate_profile(config_source)
     report = json.loads((candidate / REPORT_NAME).read_text(encoding="utf-8"))
     if not (report.get("status") == "PASS" and report.get("frozen") is True
+            and report.get("input_backend") == "PyDD"
+            and report.get("real_input_sent") is False
             and report.get("real_driver_loaded") is False
             and report.get("global_hook_started") is False):
         raise RuntimeError("The candidate has not passed its packaged self-test")
@@ -184,13 +188,54 @@ def publish_release(project: Path, candidate: Path, config_source: Path) -> Path
     return project / ARCHIVE_NAME
 
 
+def publish_minimal_driver_release(
+    project: Path, candidate: Path, config_source: Path, driver_directory: Path,
+) -> Path:
+    from dd_install import DRIVER_FILES
+
+    project = project.resolve()
+    build = _within(project / "build_release", project)
+    candidate = _within(candidate, build)
+    destination = _within(project / MINIMAL_DRIVER_ARCHIVE_NAME, project)
+    release_profile = _within(project / "release" / "config.ini", project)
+    build.mkdir(parents=True, exist_ok=True)
+    with publication_lock(build / ".publish.lock"):
+        selected_profile = release_profile if release_profile.exists() else config_source
+        with TemporaryDirectory(prefix="minimal-driver-", dir=build) as staging:
+            prepared = Path(staging)
+            for name in (EXE_NAME, REPORT_NAME):
+                shutil.copy2(candidate / name, prepared / name)
+            shutil.copy2(selected_profile, prepared / "config.ini")
+            validate_candidate(prepared, config_source)
+            validate_profile(prepared / "config.ini")
+            driver_target = prepared / "driver"
+            driver_target.mkdir()
+            for name, expected_hash in DRIVER_FILES.items():
+                target = driver_target / name
+                shutil.copy2(driver_directory / name, target)
+                if sha256_file(target) != expected_hash:
+                    raise ValueError(f"Unsupported DD HID 63340 payload: {name}")
+            names = [EXE_NAME, "config.ini", *(f"driver/{name}" for name in DRIVER_FILES)]
+            archive_path = prepared / MINIMAL_DRIVER_ARCHIVE_NAME
+            create_archive(prepared, archive_path, names)
+            if sha256_file(selected_profile) != sha256_file(prepared / "config.ini"):
+                raise RuntimeError("Release configuration changed while assembling the candidate; retry")
+            os.replace(archive_path, destination)
+    return destination
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--validate-config", type=Path)
     mode.add_argument("--candidate", type=Path)
+    mode.add_argument("--verify-candidate", type=Path)
+    mode.add_argument("--minimal-driver-candidate", type=Path)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--driver-directory", type=Path)
     args = parser.parse_args()
+    if (args.minimal_driver_candidate is None) != (args.driver_directory is None):
+        parser.error("--minimal-driver-candidate and --driver-directory must be used together")
     if args.validate_config is not None:
         validate_profile(args.validate_config)
         print(f"Validated release configuration: {args.validate_config}")
@@ -199,7 +244,16 @@ def main() -> None:
     config_source = args.config or project / "config.ini"
     if args.config is None and not config_source.is_file():
         config_source = project / "config.example.ini"
-    archive = publish_release(project, args.candidate, config_source)
+    if args.verify_candidate is not None:
+        validate_candidate(args.verify_candidate, config_source)
+        print(f"Verified candidate: {args.verify_candidate}")
+        return
+    if args.minimal_driver_candidate is not None:
+        archive = publish_minimal_driver_release(
+            project, args.minimal_driver_candidate, config_source, args.driver_directory,
+        )
+    else:
+        archive = publish_release(project, args.candidate, config_source)
     print(f"Verified release ZIP: {archive}")
 
 
